@@ -1,0 +1,1780 @@
+---
+title: "Final Exam Project"
+subtitle: "Longitudinal Modelling of Animal Behaviour and Health Status Using Accelerometer Data"
+author: "Emily Lin"
+date: last-modified
+
+format:
+  html:
+    theme: cosmo
+    css: styles/custom.css
+    toc: true
+    toc-depth: 3
+    toc-location: right
+    number-sections: false
+    smooth-scroll: true
+    code-fold: false
+    code-tools: false
+    embed-resources: true
+    fig-align: center
+    fig-width: 10
+    fig-height: 5
+    df-print: paged
+    page-layout: full
+    body-width: 1150px
+    sidebar-width: 300px
+
+execute:
+  echo: false
+  warning: false
+  message: false
+  freeze: auto
+bibliography: references.bib
+editor: visual
+---
+
+```{r}
+#| label: report-setup
+#| include: false
+#| message: false
+#| warning: false
+
+source("R/00_paths.R")
+source("R/01_libraries_constants_theme.R")
+source("R/02_helpers.R")
+
+report_bundle_path <- file.path(output_dir, "report_bundle.rds")
+
+if (!file.exists(report_bundle_path)) {
+  stop(
+    "Missing outputs/report_bundle.rds. Run source('R/run_pipeline.R') before rendering report.qmd."
+  )
+}
+
+report_bundle <- readRDS(report_bundle_path)
+list2env(report_bundle, envir = .GlobalEnv)
+
+report_object_names <- ls(envir = .GlobalEnv)
+
+for (object_name in report_object_names) {
+  object_value <- get(object_name, envir = .GlobalEnv)
+
+  if (is.data.frame(object_value)) {
+    assign(
+      object_name,
+      repair_report_types(object_value),
+      envir = .GlobalEnv
+    )
+  }
+}
+
+observed_severity_levels <- WL_day21_target |>
+  dplyr::count(severity_short, name = "n_animals") |>
+  dplyr::filter(n_animals > 0) |>
+  dplyr::pull(severity_short) |>
+  as.character()
+
+observed_severity_colours <- severity_short_colours[
+  names(severity_short_colours) %in% observed_severity_levels
+]
+```
+
+# Executive Summary
+
+This report assesses whether accelerometer-derived behaviour can provide early evidence of facial eczema-related liver injury before the final enzyme-defined severity outcome is observed. Using collar-mounted accelerometer recordings from the WL cohort, the analysis investigates whether post-exposure changes in grazing, lying and rumination align with GGT-defined liver-enzyme severity measured at day 21.
+
+Building a usable dataset from the raw sensor archive required linking each recording to an individual animal across two collar sets and aligning the resulting records to a common exposure timeline. WL was selected as the sole analytical cohort because it offered the strongest combination of data volume and health outcome variation. Exploratory analysis then confirmed day 21 GGT as the primary severity endpoint and showed that sensor coverage declined after day 12, narrowing the period in which behavioural evidence could be assessed reliably.
+
+A temporal-context XGBoost classifier was selected over the existing random forest models after validation on labelled data, with grazing and lying emerging as the most reliable behavioural outputs. To make behavioural comparisons interpretable, each animal’s post-exposure activity was measured against its own pre-exposure baseline and then adjusted for the contemporaneous control pattern observed in unexposed animals.
+
+The main finding was a coherent inactivity signal during days 6–12 post-exposure. Animals that later recorded stronger liver-enzyme responses were already lying more and grazing less relative to both their own baseline and the control-referenced pattern. This signal remained most credible when the analysis was restricted to dosed animals, which provided the stricter test of whether behaviour tracked severity rather than exposure status alone. The evidence remains exploratory given the small cohort and limited severe-group support, but the direction of effect is biologically plausible and consistent with the expected behavioural response to illness.
+
+The practical implication is that accelerometer-derived grazing and lying behaviour should be pursued as a candidate early-warning signal. The immediate priority for the client is to test whether the days 6–12 inactivity pattern replicates in a larger cohort before investing in more complex prediction models.
+
+# Problem Background
+
+Sheep farmers in New Zealand and Australia face a recurring seasonal threat from facial eczema, a liver disease triggered by a fungal toxin produced on pasture during warm humid conditions [@Biosecurity_Tasmania_2025]. Liver injury can suppress growth and reproductive performance before severe cases progress to photosensitivity, skin lesions and visible welfare decline. With no curative treatment once damage has taken hold, the burden of management falls on prevention and timely recognition.
+
+Detection currently relies on scheduled blood sampling of liver-enzyme markers such as GGT and GLDH [@Awanui_Veterinary_2019]. GGT is used to classify severity against established clinical thresholds, while GLDH provides a supporting continuous measure of hepatocellular damage. Both markers are clinically meaningful, but they only confirm injury once it is measurable at a collection point.
+
+Prior research has established that collar-mounted accelerometers offer a route toward continuous behavioural monitoring, with validated classifiers capable of predicting time spent grazing, ruminating and lying from raw movement signals. The client’s interest is in using those behavioural predictions to identify animals beginning to move toward more serious liver injury before the final enzyme-defined severity outcome is reached.
+
+The primary aim of this report is therefore to assess whether early post-exposure behavioural change aligns with later GGT-defined facial eczema severity. The expected warning pattern is a shift away from active grazing behaviour toward increased rest and disrupted rumination. GLDH is used to check whether any behavioural pattern is consistent with broader liver injury rather than an isolated association with the primary endpoint. The broader purpose is to give the client a clear evidential basis for judging whether accelerometer-derived behaviour is a viable foundation for earlier facial eczema detection in practice.
+
+# Raw Data Description
+
+The data supplied for this project span four farm programmes: FG, IM, OS and WL. Together, the raw accelerometer archive comprises daily sensor files from 172 SD cards recorded between November 2025 and April 2026. Each programme represents a separate facial eczema study cohort, with farms containing both dosed and control animals with the exception of IM where only dosed animals were present. The study design follows animals across a common relative timeline, beginning with a pre-exposure baseline at day -7 and continuing through scheduled assessment points at day 0, day 1, day 7 and day 21.
+
+```{r}
+#| label: fig-study-timeline
+#| fig-cap: "Common study timeline used across the farm programmes. Day 0 marks the facial eczema exposure point, with health assessments scheduled at baseline, acute, recovery and final follow-up stages."
+#| message: false
+#| warning: false
+#| fig-height: 1.5
+
+timeline_points <- tibble::tibble(
+  study_day = c(-7, 0, 1, 7, 21),
+  display_x = c(1, 2.8, 3.5, 5.4, 8.8),
+  day_label = c("Day -7", "Day 0", "Day 1", "Day 7", "Day 21"),
+  stage = c(
+    "Baseline",
+    "Exposure",
+    "Acute",
+    "Recovery",
+    "Final\nfollow-up"
+  ),
+  day_y = c(0.16, 0.16, 0.16, 0.16, 0.16),
+  stage_y = c(-0.2, -0.2, -0.2, -0.2, -0.2)
+)
+
+ggplot(timeline_points, aes(x = display_x, y = 0)) +
+  geom_segment(
+    aes(x = 0.7, xend = 9.4, y = 0, yend = 0),
+    linewidth = 0.8,
+    colour = "grey40",
+    arrow = arrow(length = unit(0.18, "inches"), type = "closed")
+  ) +
+  geom_point(size = 4.5, colour = "black") +
+  geom_text(
+    aes(y = day_y, label = day_label),
+    fontface = "bold",
+    size = 4
+  ) +
+  geom_text(
+    aes(y = stage_y, label = stage),
+    size = 3.8,
+    lineheight = 0.95
+  ) +
+  coord_cartesian(xlim = c(0.3, 9.7), ylim = c(-0.45, 0.38), clip = "off") +
+  theme_void(base_size = 11) 
+```
+
+The accelerometer component consists of raw collar recordings stored within farm-specific sets and labelled by SD card identifier. Each file contains timestamped movement records across the recording day, using New Zealand time, with acceleration measured along the X, Y and Z axes. Supporting study files provide the animal-level context needed to interpret those movement records. Metadata files link collars, SD cards and animal identifiers, while health records provide GGT and GLDH measurements at the scheduled study days. Production files containing body weight and average daily gain are also available but fall outside the scope of the current analysis and are therefore not used.
+
+# Constructing the Analytical Dataset
+
+The key challenge posed by the data is that the evidence initially exists as fragmented sensor files rather than an animal-level study dataset, so the first task is to build a structured longitudinal record in which each animal can be followed through time with sensor recordings aligned to exposure status and scheduled health measurements.
+
+```{r}
+#| label: dataset-construction-snapshot
+#| echo: false
+#| results: asis
+#| message: false
+#| warning: false
+
+snapshot_cards <- tibble::tibble(
+  label = c(
+    "Archive programmes",
+    "WL accelerometer files",
+    "Linked files",
+    "Cleaned files",
+    "Analysis animals",
+    "Health records"
+  ),
+  value = c(
+    "4",
+    "625",
+    "590",
+    "587",
+    "28",
+    "112"
+  ),
+  detail = c(
+    "FG, IM, OS, and WL screened",
+    "Across 51 SD cards",
+    "With animal assignment",
+    "After 4 read-error exclusions",
+    "With linked sensor and health data",
+    "Across five scheduled study days"
+  )
+)
+
+cards_html <- snapshot_cards |>
+  dplyr::mutate(
+    card = glue::glue(
+      '<div class="metric-card">
+        <div class="metric-value">{value}</div>
+        <div class="metric-label">{label}</div>
+        <div class="metric-detail">{detail}</div>
+      </div>'
+    )
+  ) |>
+  dplyr::pull(card) |>
+  paste(collapse = "\n")
+
+htmltools::HTML(glue::glue(
+  '<section class="construction-snapshot">
+     <p class="snapshot-subtitle">Key retained counts before behavioural analysis.</p>
+     <div class="metric-grid">
+       {cards_html}
+     </div>
+   </section>'
+))
+```
+
+:::::::: construction-steps
+::: construction-step
+[Step 1]{.step-kicker}
+
+### Select the WL cohort
+
+<p class="action-sentence">
+
+Use WL as the primary analytical cohort for the early-warning analysis.
+
+</p>
+
+WL provided the strongest basis for the behaviour–health question. It contained the largest available data volume, with $625$ accelerometer files across $51$ SD cards, and had the greatest concentration of animals with elevated GGT outcomes. The cohorts were not pooled because differences in recording conditions and study timelines could obscure the relationship between behaviour change and later liver-enzyme response.
+:::
+
+::: construction-step
+[Step 2]{.step-kicker}
+
+### Link sensor files to animals
+
+<p class="action-sentence">
+
+Map each usable WL accelerometer file to the animal that generated it.
+
+</p>
+
+Collar metadata were used to connect SD card identifiers with collar numbers and animal IDs across two recording sets. Files were retained when the animal assignment could be recovered, including cases where collar or SD card changes could still be traced through the study. Files with no recoverable animal identifier were excluded, leaving 590 successfully linked files carried forward.
+:::
+
+::: construction-step
+[Step 3]{.step-kicker}
+
+### Align health records and sensor files to a shared timeline
+
+<p class="action-sentence">
+
+Place behaviour and liver-enzyme records onto the same animal-level study-day scale.
+
+</p>
+
+GGT and GLDH records were reformatted so each row represented one animal at one scheduled study day. Original enzyme values were retained for threshold-based severity classification, with log-transformed versions prepared for visualisation and modelling. The cohort was restricted to animals with both linked accelerometer files and health measurements, leaving 28 eligible animals and 112 health records. Sensor files were then aligned to the exposure timeline using 31 March 2026 as day 0.
+:::
+
+::: construction-step
+[Step 4]{.step-kicker}
+
+### Audit raw sensor files and remove unreliable data
+
+<p class="action-sentence">
+
+Screen the raw accelerometer files before generating behaviour summaries.
+
+</p>
+
+Files with unrecoverable read errors were excluded, while invalid timestamps and sustained zero-signal periods were removed as recording failures. Duplicate timestamps were resolved by averaging acceleration values at matching time points. Extreme acceleration values were audited but retained as possible short-duration movement spikes rather than automatically treated as artefacts. Partial-day recordings were kept where useful, with quality flags carried forward so later analyses could account for recording reliability.
+:::
+
+::: construction-step
+[Step 5]{.step-kicker}
+
+### Carry recording coverage forward as a reliability filter
+
+<p class="action-sentence">
+
+Classify each animal-day by the amount and completeness of usable sensor data.
+
+</p>
+
+Animal-days with at least 20 recorded hours and strong timestamp completeness were classified as high coverage, while shorter but still usable recordings were classified as partial or low coverage. Across the retained files, $80\%$ of animal-days achieved high coverage and a further 7% were partial. These labels were carried into later analyses so apparent behavioural changes could be interpreted against the recording evidence behind them.
+:::
+::::::::
+
+# Establishing the Behaviour–Health Evidence Base
+
+```{r}
+#| label: health-eda-setup
+#| include: false
+#| message: false
+#| warning: false
+
+WL_health_eda <- WL_health_data_clean |>
+  mutate(
+    exposure_group = factor(
+      exposure_group,
+      levels = c("Control", "Dosed")
+    ),
+    fe_severity_class = factor(
+      fe_severity_class,
+      levels = severity_levels
+    ),
+    severity_short = recode(
+      as.character(fe_severity_class),
+      !!!severity_short_labels
+    ),
+    severity_short = factor(
+      severity_short,
+      levels = severity_short_labels[severity_levels]
+    )
+  )
+
+WL_day21_target <- WL_health_eda |>
+  filter(study_day == 21) |>
+  distinct(
+    animal_id,
+    exposure_group,
+    ggt_day21,
+    gldh_day21,
+    fe_severity_class,
+    severity_short,
+    clinically_elevated_ggt
+  )
+
+WL_health_long_eda <- WL_health_eda |>
+  select(
+    animal_id,
+    exposure_group,
+    study_day,
+    ggt,
+    gldh,
+    log_ggt,
+    log_gldh,
+    fe_severity_class,
+    severity_short
+  ) |>
+  pivot_longer(
+    cols = c(ggt, gldh),
+    names_to = "marker",
+    values_to = "raw_value"
+  ) |>
+  mutate(
+    marker = recode(
+      marker,
+      ggt = "GGT",
+      gldh = "GLDH"
+    ),
+    marker = factor(marker, levels = c("GGT", "GLDH")),
+    log_value = log1p(raw_value)
+  )
+
+observed_severity_levels <- WL_day21_target |>
+  count(severity_short, name = "n_animals") |>
+  filter(n_animals > 0) |>
+  pull(severity_short) |>
+  as.character()
+
+observed_severity_colours <- severity_short_colours[
+  names(severity_short_colours) %in% observed_severity_levels
+]
+
+WL_day21_target <- WL_day21_target |>
+  mutate(
+    severity_short = factor(
+      severity_short,
+      levels = observed_severity_levels
+    )
+  )
+
+WL_health_eda <- WL_health_eda |>
+  mutate(
+    severity_short = factor(
+      severity_short,
+      levels = observed_severity_levels
+    )
+  )
+
+WL_health_long_eda <- WL_health_long_eda |>
+  mutate(
+    severity_short = factor(
+      severity_short,
+      levels = observed_severity_levels
+    )
+  )
+```
+
+Following construction of the dataset, the analysis first needed to establish whether the health and sensor records formed a credible basis for the early-warning question. This section sets the decision basis for the behavioural analysis by confirming that day 21 GGT provides a usable health endpoint and by locating the early-warning window that is both biologically meaningful and sufficiently supported by sensor coverage.
+
+## Defining the Follow-up Health Endpoint
+
+The retained cohort of 28 animals comprised of 8 controls and 20 dosed (@fig-eda-cohort-and-health-target, Panel A), keeping the clear exposure comparison. Within the dosed group, animals further separated into four severity classes based on day 21 GGT levels as shown in Panel B, allowing the analysis to move beyond exposed-versus-control differences and assess whether early behaviour varied with later severity. Severity classes were defined using client-provided GGT thresholds:
+
+-   `< 70 IU/L` (Below-Threshold)
+-   `70-300 IU/L` (Mild)
+-   `301-700 IU/L` (Moderate)
+-   `>700 IU/L` (Severe)
+
+The main constraint is that the severe class contained only 4 animals. Where later analyses apply additional filters, the number of contributing animals needed to be checked explicitly to avoid conclusions being drawn from a single animal's pattern.
+
+```{r}
+#| label: fig-eda-cohort-and-health-target
+#| fig-cap: "WL cohort after accelerometer-health linkage. Panel A shows the retained exposure groups. Panel B shows day 21 GGT severity classes among dosed animals, which form the main health target."
+#| message: false
+#| echo: true
+#| warning: false
+
+p_cohort <- WL_health_eda |>
+  distinct(animal_id, exposure_group) |>
+  count(exposure_group, name = "n_animals") |>
+  ggplot(aes(x = exposure_group, y = n_animals, fill = exposure_group)) +
+  geom_col(width = 0.5, colour = NA) +
+  geom_text(
+    aes(label = n_animals),
+    vjust = -0.55,
+    fontface = "bold",
+    size = 4,
+    colour = "grey25"
+  ) +
+  scale_fill_manual(values = group_colours, labels = group_labels) +
+  scale_y_continuous(
+    breaks = seq(0, 20, by = 5),
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "A — Retained cohort",
+    x = NULL,
+    y = "Animals"
+  ) +
+  theme_eda(base_size = 10) +
+  theme(legend.position = "none")
+
+p_day21_severity <- WL_day21_target |>
+  filter(exposure_group == "Dosed") |>
+  count(severity_short, name = "n_animals") |>
+  mutate(
+    severity_short = factor(
+      severity_short,
+      levels = setdiff(observed_severity_levels, "Control")
+    )
+  ) |>
+  ggplot(aes(x = severity_short, y = n_animals, fill = severity_short)) +
+  geom_col(width = 0.55, colour = NA) +
+  geom_text(
+    aes(label = n_animals),
+    vjust = -0.5,
+    fontface = "bold",
+    size = 3.7,
+    colour = "grey25"
+  ) +
+  scale_fill_manual(values = observed_severity_colours, drop = TRUE) +
+  scale_y_continuous(
+    breaks = seq(0, 10, by = 2),
+    expand = expansion(mult = c(0, 0.22))
+  ) +
+  labs(
+    title = "B — Day 21 GGT severity among dosed animals",
+    x = NULL,
+    y = "Animals"
+  ) +
+  theme_eda(base_size = 10) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(hjust = 0.5)
+  )
+
+(p_cohort | p_day21_severity) +
+  plot_annotation(
+    title = "WL cohort structure and day 21 GGT severity",
+    subtitle = "The EDA first checks the retained cohort, then defines the severity endpoint within the dosed animals.",
+    theme = theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 11,
+        colour = "#1e2820",
+        margin = ggplot2::margin(t = 16, b = 6, l = 20)
+      ), 
+      plot.subtitle = element_text(
+        size = 10,
+        colour = "grey40",
+        margin = ggplot2::margin(b = 2, l = 20)
+      )
+    )
+  )
+```
+
+## Timing of the Biochemical Response
+
+The trajectories in @fig-eda-primary-supporting-health-trajectories are used to locate the period in which biochemical separation becomes most evident. As expected in an exposure-response setting, the clearest group separation occurred later in the study, particularly between days 7-21, when the severe group moves away from the other severity classes in both GGT and GLDH levels. This made the period before day 7, and the early part of the days 7-21 separation period, the most relevant window for behavioural early-warning evidence before the final liver-enzyme outcome is observed. GGT was used in this report as the main outcome for behavioural signals, with GLDH kept secondary as it appeared slightly elevated even before exposure.
+
+```{r}
+#| label: fig-eda-primary-supporting-health-trajectories
+#| fig-cap: Longitudinal GGT and GLDH trajectories by day 21 GGT severity. GGT is used as the primary severity-defining outcome, while GLDH is retained as a supporting liver-enzyme marker."
+#| message: false
+#| warning: false
+#| echo: true
+
+health_summary_eda <- WL_health_long_eda |>
+  group_by(marker, severity_short, study_day) |>
+  summarise(
+    median_log_value = median(log_value, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    marker = factor(marker, levels = c("GGT", "GLDH")),
+    severity_short = factor(
+      severity_short,
+      levels = observed_severity_levels
+    )
+  )
+
+reference_days <- tibble(
+  study_day = c(-7, 0, 1, 7, 21)
+)
+
+ggplot(
+  health_summary_eda,
+  aes(
+    x = study_day,
+    y = median_log_value,
+    colour = severity_short,
+    group = severity_short
+  )
+) +
+  geom_vline(
+    data = reference_days,
+    aes(xintercept = study_day),
+    inherit.aes = FALSE,
+    linetype = "dashed",
+    colour = "grey72",
+    linewidth = 0.45
+  ) +
+  geom_line(linewidth = 1.05) +
+  geom_point(size = 2.5) +
+  facet_wrap(
+    ~ marker,
+    ncol = 1,
+    scales = "free_y",
+    strip.position = "top"
+  ) +
+  scale_colour_manual(
+    values = observed_severity_colours,
+    drop = TRUE
+  ) +
+  scale_x_continuous(
+    breaks = c(-7, 0, 1, 7, 21),
+    expand = expansion(mult = c(0.02, 0.04))
+  ) +
+  labs(
+    title = "Health trajectories across the study timeline",
+    subtitle = "Dashed lines mark the scheduled health assessment days.",
+    x = "Study day",
+    y = "Median log(value + 1)",
+    colour = "Day 21 GGT severity"
+  ) +
+  theme_eda(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    panel.spacing.y = unit(1.6, "lines")
+  ) +
+  guides(
+    colour = guide_legend(nrow = 1, byrow = TRUE)
+  )
+```
+
+## Sensor Coverage for Longitudinal Behaviour Analysis
+
+The cleaned accelerometer records were then checked for sufficient recording coverage across the study timeline to support the behavioural summaries. @fig-eda-accelerometer-coverage-readiness shows that coverage is strongest around the pre-exposure and dosing period, and remained sufficient through much of the days $6$-$12$ window. Less consistency is observed between days 1-5, and coverage becomes even more limited after day 12 as several recordings stop before follow-up. This is a meaningful finding because it adjusts the target window identified from the biochemical trajectories. Although earlier behavioural change is preferred, the usable early-warning window also needs enough sensor coverage to support reliable animal-level summaries. This justifies filtering for high or partial coverage in the remaining analysis to reduce the risk that apparent behavioural changes reflect incomplete recording rather than true behavioural differences.
+
+```{r}
+#| label: fig-eda-accelerometer-coverage-readiness
+#| fig-cap: "Cleaned accelerometer coverage across WL animals. High coverage requires at least 20 recorded hours and at least 80% timestamp completeness within the observed recording span."
+#| message: false
+#| warning: false
+#| echo: true
+#| fig-width: 11
+#| fig-height: 8
+
+coverage_plot_data <- WL_accelerometer_coverage |>
+  mutate(
+    animal_id = as.character(animal_id),
+    recording_date = as.Date(recording_date)
+  ) |>
+  left_join(
+    WL_day21_target |>
+      select(animal_id, exposure_group, severity_short),
+    by = "animal_id"
+  ) |>
+  mutate(
+    severity_short = replace_na(as.character(severity_short), "Unlinked"),
+    severity_short = factor(
+      severity_short,
+      levels = c("Control", "Below threshold", "Mild", "Moderate", "Severe", "Unlinked")
+    ),
+    coverage_category = factor(
+      coverage_category,
+      levels = names(coverage_colours)
+    ),
+    time_index = recording_study_day
+  )
+
+reference_lines <- tibble(
+  time_index = c(-7, 0, 1, 7, 21),
+  reference = c("Baseline", "Exposure", "Acute", "Recovery", "Follow-up")
+)
+
+animal_order <- coverage_plot_data |>
+  distinct(animal_id, severity_short) |>
+  arrange(severity_short, animal_id) |>
+  pull(animal_id)
+
+coverage_plot_data |>
+  mutate(
+    animal_id = factor(animal_id, levels = rev(animal_order))
+  ) |>
+  ggplot(
+    aes(
+      x = time_index,
+      y = animal_id,
+      fill = coverage_category
+    )
+  ) +
+  geom_tile(colour = "white", linewidth = 0.16) +
+  geom_vline(
+    data = reference_lines,
+    aes(xintercept = time_index),
+    inherit.aes = FALSE,
+    colour = "grey55",
+    linewidth = 0.6,
+    linetype = "dashed"
+  ) +
+  facet_grid(
+    severity_short ~ .,
+    scales = "free_y",
+    space = "free_y",
+    switch = "y"
+  ) +
+  scale_fill_manual(values = coverage_colours, na.value = "grey92", drop = FALSE) +
+  scale_x_continuous(
+    breaks = c(-10, -7, 0, 1, 7, 14, 21),
+    expand = expansion(add = 0.5)
+  ) +
+  labs(
+    title = "Accelerometer coverage carried forward as a modelling reliability constraint",
+    subtitle = "Dashed lines mark the scheduled health assessment days; coverage reflects both recorded time and timestamp completeness.",
+    x = "Study day",
+    y = "Animal ID",
+    fill = "Coverage"
+  ) +
+  theme_eda(base_size = 11) +
+  theme(
+    plot.title.position = "plot",
+    plot.title = element_text(
+    hjust = 0,
+    margin = ggplot2::margin(t = 6, b = 6, l=10)
+  ),
+  plot.subtitle = element_text(
+    hjust = 0,
+    margin = ggplot2::margin(b = 16, l=10)
+  ),
+    panel.grid = element_blank(),
+    panel.spacing.y = unit(0.35, "lines"),
+    strip.placement = "outside",
+    strip.background.y = element_rect(fill = "grey90", colour = "grey75", linewidth = 0.4),
+    strip.text.y.left = element_text(
+      angle = 0,
+      hjust = 0.5,
+      face = "bold",
+      colour = "grey25",
+      margin = ggplot2::margin(r = 6, l = 6)
+    ),
+    axis.text.y = element_text(size = 5.5, family = "mono", colour = "grey35"),
+    axis.text.x = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+```
+
+# Behaviour classification and Model Evaluation
+
+Every behavioural comparison made against GGT outcomes depends on whether the classification layer can reconstruct behaviour from raw accelerometer signal with sufficient accuracy. Systematic misclassification of grazing, lying or rumination would distort the behavioural summaries before they reach the health analysis, so establishing a defensible classification layer was a prerequisite to the main modelling.
+
+## Existing Classification Framework
+
+The supplied Random Forest models were developed by [@Schutz_2026] using labelled observations from 30 Romney ewes at the AgResearch Ruakura farm in Hamilton, New Zealand. Each animal wore a collar-mounted tri-axial accelerometer while behaviour was recorded through 30-second immediate scan sampling over an eight-hour daytime observation window. Separate binary classifiers were trained for grazing, rumination and posture, so each model estimated whether a specific behaviour was present at a given observation point.
+
+The original models used five movement summaries derived from the accelerometer signals:
+
+-   Rolling means for the X, Y, and Z axes (`ax_rm`, `ay_rm`, `az_rm`)
+-   Rolling mean absolute dispersion of the acceleration resultant (`ar_rv`)
+-   Rolling kurtosis of the acceleration resultant (`ar_rk`)
+
+These features formed the benchmark input set and the practical comparison point for any candidate model.
+
+## Candidate Models
+
+Two XGBoost models were evaluated against the random forest benchmark. The first used the same five movement features, testing whether a boosting approach could improve classification without changing the input information. The second extended the feature set with lagged values and short-window rolling summaries to incorporate recent movement history. This temporal-context extension was motivated by the natural bout structure of sheep behaviour, where grazing, lying and rumination occur in bouts rather than isolated records, so surrounding movement patterns provide useful context for distinguishing behaviours that may appear similar at a single time point.
+
+### Comparison Design and Results
+
+All models were evaluated on the original labelled validation dataset using leave-one-collar-out cross-validation, which held out all records from one collar at a time during testing. This is a stricter assessment than a random observation-level split because it evaluates how well each classifier generalises to animals not seen during training.
+
+Performance was assessed using sensitivity, specificity, F1 score and AUC. Sensitivity was given particular weight because missed behaviour events would bias the animal-level time budgets used in the later health analysis.
+
+::: metric-aside
+## **F1 score**: Summarises the balance between detecting true behaviour events and avoiding false detections. Useful when the behaviour of interest is relatively uncommon.
+
+**AUC**: Checks whether true behaviour observations generally receive higher predicted probabilities than non-behaviour observations before a final yes/no cut-off is applied.
+:::
+
+Temporal-context XGBoost produced the strongest profile across all three behaviours as highlighted in @tbl-validation-metrics. Improvements for grazing over random forest were small but consistent, with all metrics increasing by no more than 0.015. This suggests the original five features already captured most of the available signal and temporal context added limited additional information for grazing. The more meaningful gains were in lying and rumination. For lying, F1 increased from 0.754 to 0.794 and AUC from 0.873 to 0.901, reflecting cleaner separation between lying and non-lying observations. Rumination saw the largest sensitivity gain of the three behaviours, rising from 0.531 to 0.653, meaning the selected model missed substantially fewer true rumination events. Despite this improvement, rumination remained the least reliably classified behaviour overall.
+
+```{r}
+#| label: tbl-validation-metrics
+#| echo: false
+#| message: false 
+#| warning: false 
+#| tbl-cap: "Behaviour classification performance under leave-one-collar-out validation. Highlighted rows indicate the classifier carried forward into the WL behaviour summaries"
+#| tbl-cap-location: bottom
+
+library(flextable)
+
+validation_metrics_overall <- readr::read_csv(
+  file.path(output_dir, "validation_loco_metrics_overall_model_comparison.csv"),
+  show_col_types = FALSE
+)
+
+validation_table <- validation_metrics_overall |>
+  dplyr::mutate(
+    Behaviour = stringr::str_to_title(behaviour),
+    Model = model,
+    Sensitivity = round(sensitivity, 3),
+    Specificity = round(specificity, 3),
+    F1 = round(f1, 3),
+    AUC = round(auc, 3),
+    selected = model == "Temporal-context XGBoost"
+  ) |>
+  dplyr::select(
+    Behaviour,
+    Model,
+    Sensitivity,
+    Specificity,
+    F1,
+    AUC,
+    selected
+  ) |>
+  dplyr::arrange(Behaviour, dplyr::desc(selected), Model)
+
+selected_rows <- which(validation_table$selected)
+
+classification_table <- validation_table |>
+  dplyr::select(-selected) |>
+  flextable::flextable() |>
+  flextable::theme_booktabs() |>
+  flextable::bg(
+    i = selected_rows,
+    bg = "#fcf5cc",
+    part = "body"
+  ) |>
+  flextable::bold(
+    i = selected_rows,
+    bold = TRUE,
+    part = "body"
+  ) |>
+  flextable::bold(part = "header") |>
+  flextable::color(
+    i = selected_rows,
+    color = "#1E2820",
+    part = "body"
+  ) |>
+  flextable::color(
+    part = "header",
+    color = "#1E2820"
+  ) |>
+  flextable::align(
+    j = c("Sensitivity", "Specificity", "F1", "AUC"),
+    align = "right",
+    part = "all"
+  ) |>
+  flextable::align(
+    j = c("Behaviour", "Model"),
+    align = "left",
+    part = "all"
+  ) |>
+  flextable::fontsize(
+    size = 10.5,
+    part = "all"
+  ) |>
+  flextable::padding(
+    padding.top = 8,
+    padding.bottom = 8,
+    padding.left = 12,
+    padding.right = 12,
+    part = "all"
+  ) |>
+  flextable::height_all(
+    height = 0.34,
+    part = "body"
+  ) |>
+  flextable::height(
+    height = 0.38,
+    part = "header"
+  ) |>
+  flextable::set_table_properties(
+  layout = "fixed",
+  width = 1
+) |>
+  flextable::width(j = "Behaviour", width = 1.1) |>
+  flextable::width(j = "Model", width = 3.2) |>
+  flextable::width(j = c("Sensitivity", "Specificity"), width = 0.9) |>
+  flextable::width(j = c("F1", "AUC"), width = 0.65) |> 
+  flextable::border_outer(
+    border = officer::fp_border(color = "#B8AFA0", width = 1)
+  ) |>
+  flextable::border_inner_h(
+    border = officer::fp_border(color = "#E4EDE2", width = 0.6)
+  ) 
+
+classification_table
+```
+
+## Generating WL Behaviour Summaries
+
+The temporal-context XGBoost classifier was applied to the cleaned WL accelerometer files to generate record-level behaviour predictions. The original five accelerometer features were computed from the raw X, Y and Z acceleration axes, and the additional temporal-context features were constructed using the same feature definitions applied during validation. Predictions were then aggregated into animal-hour and animal-day summaries by calculating the proportion of usable records classified as grazing, lying or ruminating. Hourly summaries were used to check within-day structure, while daily summaries provided the animal-level behavioural quantities used in later longitudinal comparisons.
+
+### Checking Biological Plausibility
+
+Because the WL cohort was unlabelled, the deployed predictions required a plausibility check before entering the health analysis. A classifier that performs well in validation can still produce unrealistic structure when applied to a dataset collected under different conditions.
+
+The circadian patterns in @fig-circadian-behaviour-patterns show consistency with expected daily sheep behaviour. Lying dominated the overnight period, reaching its highest predicted proportions between midnight and approximately 5am before dropping sharply at dawn as grazing activity rose. Grazing remained the dominant daytime behaviour through much of the daylight hours, with lying rising again from the late evening onward. This crossover pattern is biologically coherent given that grazing requires an upright posture and sheep usually rest at night.
+
+Rumination predictions were low and relatively flat throughout the full 24-hour period, which is harder to reconcile with known behaviour. Sheep typically spend several hours per day ruminating, often during rest periods, so the predicted proportions are lower than would be expected biologically [@Sheep_ruminating]. This may reflect a deployment limitation rather than a true absence of rumination in the cohort. The validation data were collected over an eight-hour daytime window, so the classifier had limited exposure to the overnight periods when rumination is most common in practice. Predictions in those periods should therefore be interpreted with caution, and rumination summaries in the health analysis are treated accordingly as supplementary evidence.
+
+```{r}
+#| label: fig-circadian-behaviour-patterns
+#| fig-cap: "Predicted circadian behaviour patterns from the selected Temporal-context XGBoost classifier. Lines show the median animal-level hourly predicted behaviour proportion across high- and partial-coverage recordings; ribbons show the interquartile range across animals."
+#| message: false
+#| warning: false
+#| echo: true
+
+circadian_plot_data <- WL_circadian_behaviour_summary |>
+  dplyr::filter(summary_type == "Predicted proportion") |>
+  dplyr::mutate(
+    behaviour = factor(
+      behaviour,
+      levels = c("Grazing", "Lying", "Ruminating")
+    )
+  )
+
+circadian_label_data <- circadian_plot_data |>
+  dplyr::group_by(behaviour) |>
+  dplyr::filter(hour_of_day == max(hour_of_day, na.rm = TRUE)) |>
+  dplyr::ungroup() |>
+    dplyr::mutate(
+    label_x = 23,
+    label_y = dplyr::case_when(
+      behaviour == "Grazing" ~ median_value + 0.05,
+      behaviour == "Lying" ~ median_value - 0.05,
+      behaviour == "Ruminating" ~ median_value -0.05,
+      TRUE ~ median_value
+    )
+    )
+
+ggplot(
+  circadian_plot_data,
+  aes(
+    x = hour_of_day,
+    y = median_value,
+    colour = behaviour,
+    group = behaviour
+  )
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2.1) +
+  geom_text(
+    data = circadian_label_data,
+    aes(x = label_x, y = label_y, label = behaviour),
+    size = 3.3,
+    fontface = "bold",
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(values = behaviour_colours) +
+  scale_x_continuous(
+    breaks = seq(0, 23, by = 3),
+    labels = paste0(seq(0, 23, by = 3), ":00"),
+    limits = c(0, 24.4),
+    expand = expansion(mult = c(0.01, 0.02))
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, NA)
+  ) +
+  labs(
+    title = "Predicted behaviour follows an interpretable daily rhythm",
+    subtitle = "Hourly summaries are averaged at animal level first so animals with more recordings do not dominate the pattern.",
+    x = "Hour of day",
+    y = "Predicted behaviour proportion",
+    colour = "Behaviour"
+  ) +
+  theme_eda(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+```
+
+### Prediction Support for Behaviours
+
+A conditional probability summary was calculated to assess how confidently the classifier supported its positive predictions across the WL recordings, restricted to periods with sufficient sensor coverage. @fig-conditional-probability-support-temporal-xgb shows that lying predictions received the strongest and most consistent support, with a median predicted probability of approximately 87% and a very narrow interquartile range across animals. Grazing sat at around 70% with a substantially wider spread, reflecting more variable prediction confidence between animals. Rumination had the weakest support, with a median just above 60% and its interquartile range sitting close to the 50% decision boundary. This means that a meaningful proportion of positive rumination predictions were made with only marginal confidence, adding a further layer of uncertainty to its use as a health signal beyond the validation performance alone.
+
+```{r}
+#| label: fig-conditional-probability-support-temporal-xgb
+#| fig-cap: "Classifier support among positive behaviour predictions. Points show the median probability attached to positive predictions; bars show the interquartile range across animals."
+#| echo: true
+#| message: false
+#| warning: false
+#| fig-height: 3
+
+support_plot_data <- WL_conditional_support_summary |>
+  dplyr::mutate(
+    behaviour = factor(
+      behaviour,
+      levels = c("Lying", "Grazing", "Ruminating")
+    ),
+    behaviour_y = case_when(
+      behaviour == "Lying" ~ 1.6,
+      behaviour == "Grazing" ~ 1.4,
+      behaviour == "Ruminating" ~ 1.2
+    ),
+    label_y = behaviour_y + 0.1
+  )
+
+ggplot(
+  support_plot_data,
+  aes(
+    colour = behaviour
+  )
+) +
+  geom_vline(
+    xintercept = 0.50,
+    linetype = "dashed",
+    colour = "grey55",
+    linewidth = 0.45
+  ) +
+  geom_segment(
+    aes(
+      x = lower_quartile_when_positive,
+      xend = upper_quartile_when_positive,
+      y = behaviour_y,
+      yend = behaviour_y
+    ),
+    linewidth = 1.15,
+    lineend = "round"
+  ) +
+  geom_segment(
+    aes(
+      x = lower_quartile_when_positive,
+      xend = lower_quartile_when_positive,
+      y = behaviour_y - 0.03,
+      yend = behaviour_y + 0.03
+    ),
+    linewidth = 0.85
+  ) +
+  geom_segment(
+    aes(
+      x = upper_quartile_when_positive,
+      xend = upper_quartile_when_positive,
+      y = behaviour_y - 0.03,
+      yend = behaviour_y + 0.03
+    ),
+    linewidth = 0.85
+  ) +
+  geom_point(
+    aes(
+      x = median_probability_when_positive,
+      y = behaviour_y
+    ),
+    size = 3.3
+  ) +
+  geom_text(
+    aes(
+      x = median_probability_when_positive,
+      y = label_y,
+      label = behaviour
+    ),
+    fontface = "bold",
+    size = 3.7,
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(values = behaviour_colours) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0.48, 0.92),
+    breaks = seq(0.5, 0.9, by = 0.1),
+    expand = expansion(mult = c(0.01, 0.03))
+  ) +
+  scale_y_continuous(
+    limits = c(1.1, 1.85),
+    breaks = NULL
+  ) +
+  labs(
+    title = "Prediction support for behaviours",
+    subtitle = "Dashed line marks the 50% classification boundary.",
+    x = "Probability when behaviour was predicted",
+    y = NULL
+  ) +
+  theme_eda(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    plot.margin = ggplot2::margin(16, 16, 16, 16)
+  )
+```
+
+Taken together, the validation results and deployment checks provide sufficient justification for using temporal-context XGBoost as the classification layer for the WL cohort. Grazing and lying are interpreted as the primary behavioural signals, with lying carrying the strongest overall classification support. Rumination is retained as a supplementary indicator but should not be used to draw conclusions independently given both its lower validation performance and its deployment limitations on overnight data.
+
+# Longitudinal Behaviour Change After Exposure
+
+Carrying the predicted behaviours forward, the analysis can now address the early-warning problem directly. The behavioural record was treated as a possible sign of animals moving toward a stronger facial eczema response, with attention on departures from each animal’s own pre-exposure routine after dosing. Daily summaries were therefore constructed for each animal and retained only where sensor coverage was sufficient to support meaningful comparison against the later GGT and GLDH records.
+
+## Anchoring Behaviour to Pre-Exposure Baseline
+
+```{r}
+baseline_support_check <- WL_behaviour_baseline |>
+  summarise(
+    n_animals = n_distinct(animal_id),
+    median_baseline_days = median(baseline_days, na.rm = TRUE),
+    min_baseline_days = min(baseline_days, na.rm = TRUE),
+    pct_baselines_with_5plus_days = mean(baseline_days >= 5, na.rm = TRUE),
+    median_recorded_hours = median(baseline_recorded_hours, na.rm = TRUE)
+  )
+```
+
+Detecting a meaningful behavioural shift requires a reference point that reflects what is normal for each animal individually. Raw post-exposure proportions cannot distinguish a genuinely unusual change from an animal that naturally grazes less or rests more, so each animal’s pre-exposure recording days were used to establish a personal baseline. For each behaviour, the baseline was defined as the median daily proportion across available pre-exposure days, making the reference more robust to a single unusual recording day than a simple mean would be.
+
+These baselines were sufficiently supported for the intended comparison. Across animal-behaviour references, the median number of contributing pre-exposure days was `r baseline_support_check$median_baseline_days`, with a minimum of `r baseline_support_check$min_baseline_days` and `r scales::percent(baseline_support_check$pct_baselines_with_5plus_days, accuracy = 1)` used at least five pre-exposure days.
+
+## Moving from Daily Trajectories to Phase-level Summaries
+
+While baseline support was adequate, daily post-exposure trajectories were limited by how many animals retained usable recordings at each study day after coverage filtering. The severe group was the most affected, with three of four animals dropping out of the sensor record after approximately day 12, making any daily comparison beyond that point dependent on a single animal's trajectory. Phase-level summaries were therefore used in place of day-by-day comparisons to ensure each estimate rested on a stable set of animals.
+
+The two phases were chosen to reflect both recording availability and the timing of the health outcome. Days 1–5 capture the immediate post-exposure period, well ahead of the day 21 enzyme endpoint, and represent the strongest test of practical early-warning value. Days 6–12 assess whether any behavioural signal strengthens during early progression, before the later follow-up period where coverage becomes unreliable. Together they allow the analysis to ask whether animals that went on to develop more severe GGT responses had already departed from their individual baselines in the period before the final severity classification was reached.
+
+## Control-Referenced Behaviour Change
+
+Phase-level summaries alone cannot distinguish a disease-related shift from changes occurring across the whole cohort due to shared environmental or study conditions. For each behaviour and post-exposure phase, the median change observed in control animals was subtracted from each dosed animal's baseline-adjusted change, leaving the behavioural deviation that remains after accounting for what unexposed animals were doing over the same window. This control-referenced change is referred to throughout as the net change.
+
+@fig-phase-control-referenced-behaviour shows how net behavioural deviations changed across the two post-exposure windows. During days 1–5, the dosed severity groups moved in a similar direction relative to the control pattern, with lower grazing, higher lying and slightly reduced rumination. This supports an early post-exposure activity shift, but not clear severity separation, because the later GGT groups did not form a stable gradient. During days 6–12, the pattern became more severity-specific. Below-threshold and mild animals moved closer to the control-referenced baseline, while the severe group showed lower grazing and a much higher lying proportion. This made reduced grazing and increased lying the most interpretable behavioural profile for later severity, although the wider interquartile ranges and limited severe-group support mean the pattern should be treated cautiously. Rumination added little because it showed no consistent severity gradient.
+
+```{r}
+#| label: fig-phase-control-referenced-behaviour
+#| fig-cap: "Phase-level control-referenced behaviour change by day 21 GGT severity. Points show median animal-level change within each post-exposure window after subtracting the control reference; vertical ranges show the interquartile range."
+#| message: false
+#| warning: false
+#| echo: true
+
+min_animals_for_display <- 2
+
+phase_plot_data <- WL_phase_behaviour_summary |>
+  filter(
+    !is.na(severity_short),
+    severity_short != "Control",
+    n_animals >= min_animals_for_display,
+    analysis_phase %in% c("Days 1–5", "Days 6–12")
+  ) |>
+  mutate(
+    analysis_phase = factor(
+      analysis_phase,
+      levels = c("Days 1–5", "Days 6–12")
+    ),
+    behaviour = factor(
+      behaviour,
+      levels = c("Grazing", "Lying", "Ruminating")
+    ),
+    severity_short = factor(
+      severity_short,
+      levels = setdiff(observed_severity_levels, "Control")
+    )
+  )
+
+position_behaviour <- position_dodge(width = 0.38)
+
+ggplot(
+  phase_plot_data,
+  aes(
+    x = behaviour,
+    y = median_control_referenced_change,
+    colour = severity_short,
+    group = severity_short
+  )
+) +
+  geom_hline(
+    yintercept = 0,
+    colour = "grey40",
+    linewidth = 0.45
+  ) +
+  geom_errorbar(
+    aes(
+      ymin = lower_quartile_control_referenced,
+      ymax = upper_quartile_control_referenced
+    ),
+    position = position_behaviour,
+    width = 0.16,
+    linewidth = 0.7,
+    alpha = 0.8
+  ) +
+  geom_point(
+    position = position_behaviour,
+    size = 2.5,
+    alpha = 0.95
+  ) +
+  facet_wrap(
+    ~ analysis_phase,
+    nrow = 1
+  ) +
+  scale_colour_manual(
+    values = observed_severity_colours,
+    drop = TRUE
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  labs(
+    title = "Behavioural deviation in the early phase windows",
+    subtitle = "Values above zero indicate more of the behaviour than expected from the control pattern in the same phase.",
+    x = NULL,
+    y = "Control-referenced change from baseline",
+    colour = "Day 21 GGT severity"
+  ) +
+  theme_eda(base_size = 11) +
+  theme(
+    panel.spacing.x = unit(1.5, "cm"),
+    plot.margin = margin(16, 20, 16, 16)
+  )
+```
+
+# Behaviour-Health Association Analysis
+
+The phase-level results identified increased lying and reduced grazing as the most consistent post-exposure signals, particularly in the days 6–12 window where severity differentiation was strongest. The next step was to test whether those signals carry a statistically meaningful relationship with later liver-enzyme outcomes, and whether that relationship holds across both GGT and GLDH.
+
+A formal prediction model is not appropriate at this sample size. With only four severe animals and 28 animals overall, any fitted model would be underpowered and cross-validation estimates would be too unstable to support reliable performance claims. The analysis instead used univariable linear regression to assess the direction and relative strength of association between each behavioural summary measure and log-transformed day 21 GGT and GLDH. This was consistent with the main goal of establishing proof-of-concept evidence rather than a deployable system.
+
+## Behavioural Summary Measures
+
+The phase-level net changes for grazing and lying were carried forward as the core measures, along with three composite inactivity-shift summaries that directly captured the lying-grazing tradeoff the sickness-behaviour hypothesis predicted.
+
+-   `control_referenced_phase_change`
+-   `inactivity_shift_days_1_5`
+-   `inactivity_shift_days_6_12`
+-   `inactivity_shift_sustained`
+-   `inactivity_shift_progression`
+
+The sustained shift `inactivity_shift_sustained` combines both phase windows to identify animals showing persistent inactivity across the full early post-exposure period, while the progression measure `inactivity_shift_progression` captures whether the inactivity signal strengthened between phases.
+
+```{r}
+early_warning_phases <- c("Days 1–5","Days 6–12")
+primary_behaviours <- c("Grazing","Lying")
+
+WL_early_warning_features_long <- WL_behaviour_phase_control_referenced |>
+  filter(
+    analysis_phase %in% early_warning_phases,
+    behaviour %in% primary_behaviours,
+    !is.na(severity_short)
+  ) |>
+  mutate(
+    analysis_phase = factor(
+      analysis_phase,
+      levels = early_warning_phases
+    ),
+    behaviour = factor(
+      behaviour,
+      levels = c("Grazing", "Lying")
+    )
+  ) |>
+  select(
+    animal_id,
+    exposure_group,
+    severity_short,
+    fe_severity_class,
+    clinically_elevated_ggt,
+    ggt_day21,
+    gldh_day21,
+    behaviour,
+    analysis_phase,
+    control_referenced_phase_change,
+    number_of_observed_days,
+  )
+
+WL_health_model_features <- WL_early_warning_features_long |>
+  mutate(
+    feature_name = paste(
+      behaviour,
+      analysis_phase,
+      sep = "_"
+    ),
+    feature_name = stringr::str_replace_all(feature_name, "[^A-Za-z0-9]+", "_"),
+    feature_name = stringr::str_to_lower(feature_name)
+  ) |>
+  select(
+    animal_id,
+    exposure_group,
+    severity_short,
+    fe_severity_class,
+    clinically_elevated_ggt,
+    ggt_day21,
+    gldh_day21,
+    feature_name,
+    control_referenced_phase_change,
+    number_of_observed_days
+  ) |>
+  tidyr::pivot_wider(
+    names_from = feature_name,
+    values_from = c(
+      control_referenced_phase_change,
+      number_of_observed_days
+    )
+  ) |>
+  mutate(
+    log_ggt_day21 = log1p(ggt_day21),
+    log_gldh_day21 = log1p(gldh_day21),
+    clinically_elevated_ggt = as.logical(clinically_elevated_ggt),
+    severity_short = factor(
+      severity_short,
+      levels = observed_severity_levels
+    )
+  )
+WL_health_model_features <- WL_health_model_features |>
+  mutate(
+    inactivity_shift_days_1_5 = 
+      control_referenced_phase_change_lying_days_1_5 -
+      control_referenced_phase_change_grazing_days_1_5,
+    inactivity_shift_days_6_12 =
+      control_referenced_phase_change_lying_days_6_12 -
+      control_referenced_phase_change_grazing_days_6_12, 
+    inactivity_shift_sustained = inactivity_shift_days_1_5 + inactivity_shift_days_6_12,
+inactivity_shift_progression = inactivity_shift_days_6_12 - inactivity_shift_days_1_5
+  )
+```
+
+## Testing Signals Against Liver-Enzyme Outcomes
+
+```{r}
+#| label: early-behaviour-signal-testing
+#| message: false
+#| warning: false
+
+early_warning_feature_names <- c(
+  "control_referenced_phase_change_grazing_days_1_5",
+  "control_referenced_phase_change_lying_days_1_5",
+  "control_referenced_phase_change_grazing_days_6_12",
+  "control_referenced_phase_change_lying_days_6_12",
+  "inactivity_shift_days_1_5",
+  "inactivity_shift_days_6_12", 
+  "inactivity_shift_sustained",
+  "inactivity_shift_progression"
+)
+
+fit_feature_association <- function(data, outcome, feature) {
+  model_data <- data |>
+    dplyr::select(
+      outcome_value = dplyr::all_of(outcome),
+      feature_value = dplyr::all_of(feature)
+    ) |>
+    tidyr::drop_na()
+
+  if (nrow(model_data) < 5 || dplyr::n_distinct(model_data$feature_value) < 2) {
+    return(
+      tibble::tibble(
+        n_animals = nrow(model_data),
+        estimate = NA_real_,
+        lower_ci = NA_real_,
+        upper_ci = NA_real_,
+        p_value = NA_real_,
+        r_squared = NA_real_
+      )
+    )
+  }
+
+  fit <- lm(outcome_value ~ feature_value, data = model_data)
+
+  coef_summary <- summary(fit)$coefficients
+  ci <- confint(fit)
+
+  tibble::tibble(
+    n_animals = nrow(model_data),
+    estimate = coef_summary["feature_value", "Estimate"],
+    p_value = coef_summary["feature_value", "Pr(>|t|)"],
+    r_squared = summary(fit)$r.squared
+  )
+}
+
+run_feature_association_layer <- function(data, layer_name) {
+  tidyr::expand_grid(
+    outcome = c("log_ggt_day21", "log_gldh_day21"),
+    feature = early_warning_feature_names
+  ) |>
+    dplyr::mutate(
+      model_layer = layer_name,
+      result = purrr::map2(
+        outcome,
+        feature,
+        ~ fit_feature_association(
+          data = data,
+          outcome = .x,
+          feature = .y
+        )
+      )
+    ) |>
+    tidyr::unnest(result)
+}
+
+WL_health_feature_associations <- dplyr::bind_rows(
+  run_feature_association_layer(
+    data = WL_health_model_features,
+    layer_name = "Whole cohort"
+  ),
+  run_feature_association_layer(
+    data = WL_health_model_features |>
+      dplyr::filter(exposure_group == "Dosed"),
+    layer_name = "Dosed only"
+  )
+) |>
+  dplyr::mutate(
+    outcome_label = dplyr::recode(
+      outcome,
+      log_ggt_day21 = "Day 21 GGT",
+      log_gldh_day21 = "Day 21 GLDH"
+    ),
+    feature_label = dplyr::recode(
+      feature,
+      control_referenced_phase_change_grazing_days_1_5 = "Grazing change, days 1–5",
+      control_referenced_phase_change_lying_days_1_5 = "Lying change, days 1–5",
+      inactivity_shift_days_1_5 = "Inactivity shift, days 1-5",
+      control_referenced_phase_change_grazing_days_6_12 = "Grazing change, days 6–12",
+      control_referenced_phase_change_lying_days_6_12 = "Lying change, days 6–12",
+      inactivity_shift_days_6_12 = "Inactivity shift, days 6–12",
+      inactivity_shift_sustained = "Inactivity shift sustained",
+      inactivity_shift_progression = "Inactivity shift progression"
+    )
+  ) |>
+  dplyr::select(
+    model_layer,
+    outcome,
+    outcome_label,
+    feature,
+    feature_label,
+    n_animals,
+    estimate, 
+    p_value,
+    r_squared
+  )
+
+make_signal_summary_table <- function(results, layer_name) {
+  results |>
+    filter(model_layer == layer_name) |>
+    mutate(
+      feature_label = factor(
+        feature_label,
+        levels = c(
+          "Grazing change, days 1–5",
+          "Lying change, days 1–5",
+          "Inactivity shift, days 1-5",
+          "Grazing change, days 6–12",
+          "Lying change, days 6–12",
+          "Inactivity shift, days 6–12",
+          "Inactivity shift sustained",
+          "Inactivity shift progression"
+        )
+      ),
+      direction = case_when(
+        estimate > 0 ~ "↑",
+        estimate < 0 ~ "↓",
+        TRUE ~ "–"
+      ),
+      support_text = paste0(
+        direction,
+        " R² ",
+        sprintf("%.2f", r_squared),
+        ", p=",
+        case_when(
+          is.na(p_value) ~ "NA",
+          p_value < 0.001 ~ "<0.001",
+          TRUE ~ sprintf("%.3f", p_value)
+        )
+      )
+    ) |>
+    select(
+      Feature = feature_label,
+      Outcome = outcome_label,
+      support_text,
+      n_animals
+    ) |>
+    pivot_wider(
+      names_from = Outcome,
+      values_from = support_text
+    ) |>
+    mutate(
+      `Animals` = n_animals,
+      `Read-out` = case_when(
+        str_sub(`Day 21 GGT`, 1, 1) == stringr::str_sub(`Day 21 GLDH`, 1, 1) ~
+          "Consistent direction",
+        TRUE ~ "Mixed direction"
+      )
+    ) |>
+    select(
+      Feature,
+      `Day 21 GGT`,
+      `Day 21 GLDH`,
+      `Read-out`,
+      Animals
+    ) |>
+    arrange(Feature)
+}
+```
+
+The analysis was run in two layers. The whole-cohort layer included both control and dosed animals, providing the broadest test of whether the behavioural measures discriminate across the full enzyme range. Controls anchor the lower end of the GGT and GLDH distributions, giving the regression a clearer gradient to detect, and a null result here would be informative in its own right.
+
+The dosed-only layer then removed controls to ask whether early behavioural change tracked how severe the liver-enzyme response became. This is closer to the practical early-warning scenario and harder to detect because the exposed-versus-unexposed contrast is gone, but a signal that survives within the dosed group alone is more credible as a severity indicator rather than simply reflecting exposure status. Consistency in direction across both layers and across both enzyme outcomes was therefore treated as the strongest criterion for identifying a credible possible behavioural signal.
+
+### Whole-Cohort Association Check
+
+The whole-cohort results in @tbl-whole-cohort-signal-summary pointed most clearly to lying during days 6–12 and the sustained inactivity-shift measure. Both features moved in the expected direction, with greater inactivity aligning with higher later liver-enzyme response. The inactivity-shift measure gave the strongest GGT support in the table, while lying during days 6–12 was more consistent across both GGT and GLDH. By contrast, the days 1–5 lying signal was driven more by GLDH than GGT, making it less convincing as a cross-marker early-warning feature. Grazing during days 6–12 was not carried forward because its direction differed across the two enzyme outcomes. Given the small cohort, no feature was expected to provide strong formal significance, so the interpretation was based on relative signal strength, biological direction and consistency across markers.
+
+```{r}
+#| label: tbl-whole-cohort-signal-summary
+#| tbl-cap: "Whole-cohort association summary for early-warning behaviour features against day 21 liver-enzyme outcomes."
+#| echo: false
+#| message: false
+#| warning: false
+
+whole_cohort_signal_summary <- make_signal_summary_table(
+  results = WL_health_feature_associations,
+  layer_name = "Whole cohort"
+)
+
+cross_layer_consistent <- WL_health_feature_associations |>
+  dplyr::mutate(
+    direction = dplyr::case_when(
+      estimate > 0 ~ "up",
+      estimate < 0 ~ "down",
+      TRUE ~ "flat"
+    )
+  ) |>
+  dplyr::group_by(feature_label, outcome) |>
+  dplyr::summarise(
+    cross_layer_consistent = dplyr::n_distinct(
+      direction[direction != "flat"]
+    ) == 1,
+    .groups = "drop"
+  ) |>
+  dplyr::group_by(feature_label) |>
+  dplyr::summarise(
+    cross_layer_consistent = all(cross_layer_consistent),
+    .groups = "drop"
+  )
+
+whole_cohort_signal_rows <- WL_health_feature_associations |>
+  dplyr::filter(model_layer == "Whole cohort") |>
+  dplyr::mutate(
+    direction = dplyr::case_when(
+      estimate > 0 ~ "up",
+      estimate < 0 ~ "down",
+      TRUE ~ "flat"
+    )
+  ) |>
+  dplyr::group_by(feature_label) |>
+  dplyr::summarise(
+    max_r_squared = max(r_squared, na.rm = TRUE),
+    consistent_direction = dplyr::n_distinct(
+      direction[direction != "flat"]
+    ) == 1,
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(cross_layer_consistent, by = "feature_label") |>
+  dplyr::filter(consistent_direction, cross_layer_consistent) |>
+  dplyr::slice_max(
+    order_by = max_r_squared,
+    n = 2,
+    with_ties = FALSE
+  ) |>
+  dplyr::pull(feature_label)
+
+whole_cohort_signal_summary <- whole_cohort_signal_summary |>
+  dplyr::mutate(
+    Signal = dplyr::if_else(
+      as.character(Feature) %in% whole_cohort_signal_rows,
+      "●",
+      ""
+    )
+  ) |>
+  dplyr::select(
+    Signal,
+    Feature,
+    `Day 21 GGT`,
+    `Day 21 GLDH`,
+    `Read-out`,
+    Animals
+  )
+
+whole_cohort_signal_summary |>
+  flextable::flextable() |>
+  flextable::theme_booktabs() |>
+  flextable::bold(part = "header") |>
+  flextable::fontsize(size = 10.5, part = "all") |>
+  flextable::color(
+    j = "Signal",
+    color = "#3d5c3a",
+    part = "body"
+  ) |>
+  flextable::bold(
+    j = "Signal",
+    bold = TRUE,
+    part = "body"
+  ) |>
+  flextable::align(
+    j = "Signal",
+    align = "center",
+    part = "all"
+  ) |>
+  flextable::padding(
+    padding.top = 6,
+    padding.bottom = 6,
+    padding.left = 8,
+    padding.right = 8,
+    part = "all"
+  ) |>
+  flextable::width(j = "Feature", width = 2.6) |>
+  flextable::width(j = c("Day 21 GGT", "Day 21 GLDH"), width = 2.0) |>
+  flextable::width(j = "Read-out", width = 1.7) |>
+  flextable::width(j = "Animals", width = 0.8) |>
+  flextable::align(
+    j = c("Day 21 GGT", "Day 21 GLDH", "Animals"),
+    align = "center",
+    part = "all"
+  ) |>
+  flextable::border_outer(
+    border = officer::fp_border(color = "#B8AFA0", width = 1)
+  ) |>
+  flextable::border_inner_h(
+    border = officer::fp_border(color = "#d1d9ce", width = 0.6)
+  ) |>
+  flextable::border_inner_v(
+    border = officer::fp_border(color = "#d1d9ce", width = 0.6)
+  ) |>
+  flextable::vline(
+    j = c("Feature", "Day 21 GGT", "Day 21 GLDH", "Read-out"),
+    border = officer::fp_border(color = "#D8D0C4", width = 0.7),
+    part = "all"
+  ) |>
+    flextable::add_footer_lines(
+      values = "● marks the strongest rows with consistent direction across GGT and GLDH."
+    ) |>
+  flextable::fontsize(size = 9, part = "footer") |>
+  flextable::color(color = "#6b6559", part = "footer")
+```
+
+### Dosed-Only Severity Check
+
+The dosed-only layer provided a stricter check on severity variation among exposed animals. Once controls were removed, the early days 1–5 signals weakened and changed direction as shown in @tbl-dosed-only-signal-summary, suggesting that the immediate post-exposure pattern mainly captured a broad exposed-versus-unexposed difference rather than severity differences within the dosed group. The more credible remaining evidence again centred on days 6–12, where lying and the inactivity-shift progression measure retained the expected direction across GGT and GLDH. This suggests that severity-related behavioural divergence was more visible as an emerging inactivity pattern during the later early-warning window, rather than as a fully formed signal immediately after exposure. The evidence remains exploratory, but it supports carrying forward reduced grazing and increased lying as the most interpretable behavioural profile for animals moving toward stronger liver-enzyme response.
+
+```{r}
+#| label: tbl-dosed-only-signal-summary
+#| tbl-cap: "Dosed-only association summary for early-warning behaviour features against day 21 liver-enzyme outcomes."
+#| echo: false
+#| message: false
+#| warning: false
+
+dosed_only_signal_summary <- make_signal_summary_table(
+  results = WL_health_feature_associations,
+  layer_name = "Dosed only"
+)
+
+dosed_only_signal_rows <- WL_health_feature_associations |>
+  dplyr::filter(model_layer == "Dosed only") |>
+  dplyr::mutate(
+    direction = dplyr::case_when(
+      estimate > 0 ~ "up",
+      estimate < 0 ~ "down",
+      TRUE ~ "flat"
+    )
+  ) |>
+  dplyr::group_by(feature_label) |>
+  dplyr::summarise(
+    max_r_squared = max(r_squared, na.rm = TRUE),
+    consistent_direction = dplyr::n_distinct(direction[direction != "flat"]) == 1,
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(cross_layer_consistent, by = "feature_label") |>
+  dplyr::filter(consistent_direction) |>
+  dplyr::slice_max(
+    order_by = max_r_squared,
+    n = 2,
+    with_ties = FALSE
+  ) |>
+  dplyr::pull(feature_label)
+
+dosed_only_signal_summary <- dosed_only_signal_summary |>
+  dplyr::mutate(
+    Signal = dplyr::if_else(
+      as.character(Feature) %in% dosed_only_signal_rows,
+      "●",
+      ""
+    )
+  ) |>
+  dplyr::select(
+    Signal,
+    Feature,
+    `Day 21 GGT`,
+    `Day 21 GLDH`,
+    `Read-out`,
+    Animals
+  )
+
+dosed_only_signal_summary |>
+  flextable::flextable() |>
+  flextable::theme_booktabs() |>
+  flextable::bold(part = "header") |>
+  flextable::fontsize(size = 10.5, part = "all") |>
+  flextable::color(
+    j = "Signal",
+    color = "#3d5c3a",
+    part = "body"
+  ) |>
+  flextable::bold(
+    j = "Signal",
+    bold = TRUE,
+    part = "body"
+  ) |>
+  flextable::align(
+    j = "Signal",
+    align = "center",
+    part = "all"
+  ) |>
+  flextable::padding(
+    padding.top = 6,
+    padding.bottom = 6,
+    padding.left = 8,
+    padding.right = 8,
+    part = "all"
+  ) |>
+  flextable::width(j = "Feature", width = 2.6) |>
+  flextable::width(j = c("Day 21 GGT", "Day 21 GLDH"), width = 2.0) |>
+  flextable::width(j = "Read-out", width = 1.7) |>
+  flextable::width(j = "Animals", width = 0.8) |>
+  flextable::align(
+    j = c("Day 21 GGT", "Day 21 GLDH", "Animals"),
+    align = "center",
+    part = "all"
+  ) |>
+  flextable::border_outer(
+    border = officer::fp_border(color = "#B8AFA0", width = 1)
+  ) |>
+  flextable::border_inner_h(
+    border = officer::fp_border(color = "#d1d9ce", width = 0.6)
+  ) |>
+  flextable::border_inner_v(
+    border = officer::fp_border(color = "#d1d9ce", width = 0.6)
+  ) |>
+  flextable::vline(
+    j = c("Feature", "Day 21 GGT", "Day 21 GLDH", "Read-out"),
+    border = officer::fp_border(color = "#D8D0C4", width = 0.7),
+    part = "all"
+  ) |>
+    flextable::add_footer_lines(
+      values = "● marks the strongest rows with consistent direction across GGT and GLDH."
+    ) |>
+  flextable::fontsize(size = 9, part = "footer") |>
+  flextable::color(color = "#6b6559", part = "footer")
+```
+
+# Evidence Summary and Client Recommendations
+
+The analysis produced a coherent directional signal in which animals that went on to develop stronger liver-enzyme responses showed a measurable shift toward inactivity during the days 6–12 window. The evidence is not strong enough to support a deployable early-warning system, but it is sufficient to give the client a clear basis for what a confirmatory study would need to establish.
+
+## Recommendations for Moving Forward
+
+The clearest path forward is to build on the inactivity signal identified here while reducing the uncertainty that limited the current conclusions.
+
+::::::::::::::::::: deployment-roadmap
+:::::: roadmap-stage
+::: roadmap-number
+01
+:::
+
+::: roadmap-title
+Replicate the inactivity signal in a larger cohort
+:::
+
+::: roadmap-text
+The days 6-12 inactivity pattern should be tested in a cohort with substantially more animals per GGT severity class, especially in the severe group. Until the signal is visible at a group level that cannot be explained by one or two individual trajectories, it cannot be treated as a reliable indicator.
+:::
+::::::
+
+:::::: roadmap-stage
+::: roadmap-number
+02
+:::
+
+::: roadmap-title
+Improve sensor coverage across the full exposure window
+:::
+
+::: roadmap-text
+Recording continuity after day 12 was insufficient to evaluate whether the inactivity signal persisted or strengthened into the later follow-up period. Improving collar retention and battery life, alongside routine synchronisation checks, would allow the full trajectory of behavioural change to be assessed.
+:::
+::::::
+
+:::::: roadmap-stage
+::: roadmap-number
+03
+:::
+
+::: roadmap-title
+Extend the behavioural feature set once core signal is validated
+:::
+
+::: roadmap-text
+The current summaries could be extended into more explicitly temporal features such as persistence of elevated lying or reduced grazing, the rate at which inactivity strengthens following exposure, and the time taken for behaviour to return to each animal's pre-exposure pattern. These would provide a more sensitive characterisation of the behavioural response by distinguishing brief disruption from sustained change.
+:::
+::::::
+
+:::::: roadmap-stage
+::: roadmap-number
+04
+:::
+
+::: roadmap-title
+Build toward a prediction model only after the above are in place
+:::
+
+::: roadmap-text
+With the foundations established, penalised logistic or ordinal regression could be evaluated against the explainable inactivity baseline developed here, depending on whether the client wants to predict clinically elevated GGT or ordered severity class. The same features could also be translated into a simple calibrated risk score, keeping the model transparent enough for field interpretation.
+:::
+::::::
+:::::::::::::::::::
+
+# Limitations
+
+:::::::: limitation-grid
+::: limitation-card
+**Small cohort and thin severity groups**
+
+The analysis rested on 28 animals from a single farm, with only four in the severe group. Keeping the study within one farm reduced environmental confounding, but the small severe group means apparent patterns may reflect individual trajectories rather than a stable group-level signal.
+:::
+
+::: limitation-card
+**Uneven post-exposure sensor coverage**
+
+Recording availability dropped substantially after day 12, preventing analysis of the later follow-up period. This meant the analysis could not confirm whether the days 6–12 inactivity signal persisted or strengthened as liver-enzyme elevation became more severe.
+:::
+
+::: limitation-card
+**Behaviour prediction uncertainty**
+
+The classifiers were validated on a different farm under an eight-hour daytime observation window and applied here without ground-truth labels. Prediction error on the WL cohort cannot be quantified, meaning some apparent behavioural shifts may partly reflect classifier behaviour on unfamiliar data.
+:::
+
+::: limitation-card
+**Rumination could not be fully evaluated**
+
+Rumination is biologically plausible as a health-related signal but was excluded from primary analysis due to weak classifier support and low predicted proportions inconsistent with known sheep behaviour. One potentially informative behavioural pathway therefore remains unevaluated.
+:::
+
+::: limitation-card
+**Controlled exposure design**
+
+The study used a deliberate uniform challenge on day 0 rather than natural pasture exposure. The behavioural signals identified here may not directly generalise to a farm monitoring context where exposure is gradual and variable across animals and paddocks.
+:::
+::::::::
+
+# Conclusion
+
+The analysis found directional evidence that accelerometer-derived behaviour may provide an early signal of facial eczema progression in the WL cohort. Animals that went on to develop stronger GGT-defined liver-enzyme responses showed a measurable shift toward inactivity during the early post-exposure period, most clearly in the days 6–12 window, and that pattern was consistent across both GGT and GLDH and remained visible in the dosed-only severity check. No single measure reached conventional significance thresholds, which is expected given the cohort size, but the directional consistency across markers and analysis layers is more informative than any individual p-value at this scale. The current evidence is best understood as a proof-of-concept result, meaning it was sufficient to identify increased lying and reduced grazing as the behavioural targets worth pursuing, but not yet strong enough to support a deployable early-warning system.
+
+# References
