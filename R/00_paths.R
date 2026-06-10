@@ -1,7 +1,8 @@
 # R/00_paths.R
-```r
 library(here)
 library(fs)
+library(tibble)
+library(dplyr)
 
 project_dir <- here::here()
 
@@ -39,8 +40,10 @@ WL_data <- data_roots |>
   dplyr::filter(program == primary_program) |>
   dplyr::pull(data_root)
 
+if (length(WL_data) == 0) {
+  WL_data <- NA_character_
+}
+
 WL_GGT_GLDH <- file.path(WL_data, "WL results_GGT and GLDH.xlsx")
 WL_set1 <- file.path(WL_data, "Set 1", "Set 1 - collar numbers.xlsx")
 WL_set2 <- file.path(WL_data, "Set 2", "Set 2 - collar numbers.xlsx")
-```
-
