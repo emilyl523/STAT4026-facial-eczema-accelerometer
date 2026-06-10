@@ -58,7 +58,7 @@ renv::restore()
 
 Then run the full pipline:
 ```{r}
-source("R/run_pipeline.R
+source("R/run_pipeline.R")
 ```
 
 This creates the report-ready output bundle:
