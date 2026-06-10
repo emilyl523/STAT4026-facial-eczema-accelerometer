@@ -3,14 +3,21 @@
 .Rproj.user/
 .DS_Store
 
-# Private or large data
-data/raw/
-data/validation/
+# Private or large input data
+data/raw/*
+!data/raw/README.md
+
+data/validation/*
+!data/validation/README.md
 
 # Generated outputs
-outputs/
+outputs/*
 !outputs/README.md
 
-# Rendered report output
+# Rendered report files
 *.html
 *_files/
+
+# Quarto cache/freeze artifacts if not intentionally tracked
+_freeze/
+.cache/
